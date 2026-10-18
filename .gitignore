@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime state
+*.db
+*.sqlite3
+*.pkl
+*.tmp
+mcp_servers/**/_sim_state.json
+mcp_servers/**/ha_state.json
+
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# Generated Phase 2 index
+/data/chroma/
+
+# Orchestration validation reports may contain provider responses
+/validation_reports/
