@@ -90,21 +90,33 @@ def test_simulated_get_latest_quote_shape_and_disclosure():
 
 
 # ---------------------------------------------------------------------------
-# The real yfinance seam — genuinely exercised (not mocked), proving it
-# fails fast and legibly in this network-restricted sandbox rather than
-# hanging or raising something uncatchable. This is the honest test for a
-# component this sandbox cannot fully exercise end-to-end.
+# The real yfinance seam — provider outages are simulated so these tests
+# remain deterministic on runners with or without Yahoo Finance access.
 # ---------------------------------------------------------------------------
 
-def test_yfinance_provider_fails_clearly_in_this_sandbox():
+def test_yfinance_provider_surfaces_download_failure(monkeypatch):
+    import yfinance as yf
+
+    def unavailable(*args, **kwargs):
+        raise ConnectionError("simulated network outage")
+
+    monkeypatch.setattr(yf, "download", unavailable)
     p = YFinanceProvider()
-    with pytest.raises(MarketDataUnavailableError):
+    with pytest.raises(MarketDataUnavailableError, match="ConnectionError"):
         p.get_daily_bars("RELIANCE.NS", dt.date(2025, 1, 1), dt.date(2025, 2, 1))
 
 
-def test_yfinance_provider_quote_fails_clearly_in_this_sandbox():
+def test_yfinance_provider_surfaces_quote_failure(monkeypatch):
+    import yfinance as yf
+
+    class UnavailableTicker:
+        @property
+        def fast_info(self):
+            raise ConnectionError("simulated network outage")
+
+    monkeypatch.setattr(yf, "Ticker", lambda symbol: UnavailableTicker())
     p = YFinanceProvider()
-    with pytest.raises(MarketDataUnavailableError):
+    with pytest.raises(MarketDataUnavailableError, match="ConnectionError"):
         p.get_latest_quote("TCS.NS")
 
 

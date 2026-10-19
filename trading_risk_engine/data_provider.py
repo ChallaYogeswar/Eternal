@@ -6,14 +6,8 @@ tickers), NSE bhavcopy, or Kite Connect." This module defines one
 interface (`MarketDataProvider`) and two implementations:
 
 - `YFinanceProvider` — real, not simulated. It makes a genuine call
-  against the `yfinance` package. It will fail in THIS sandbox, because
-  network egress here is restricted to package registries and source-code
-  hosts (see the repo's network configuration) — Yahoo Finance's own
-  endpoints are not reachable from here. That is a sandbox limitation,
-  not a defect in this code; `tests/test_data_provider.py` proves the
-  failure is caught and surfaced clearly rather than hanging or crashing
-  unpredictably, which is the honest thing to test when the real network
-  call itself can't be exercised end-to-end here.
+  against the `yfinance` package and surfaces download and quote failures
+  as `MarketDataUnavailableError`.
 - `SimulatedMarketDataProvider` — the honest stand-in used by every test,
   the narrative demo, and the backtester/paper-trader examples in this
   phase. It generates deterministic (seeded), statistically reasonable
@@ -58,11 +52,9 @@ class MarketDataProvider(ABC):
 
 class YFinanceProvider(MarketDataProvider):
     """Real implementation. Requires the `yfinance` package (pip-
-    installable; the PACKAGE ITSELF installs fine anywhere pypi.org is
-    reachable) and, separately, live network access to Yahoo Finance's
-    endpoints at call time — that second requirement is the part this
-    sandbox cannot satisfy. Deploy this unchanged on a machine with
-    normal internet access; nothing about this class is sandbox-specific.
+    installable) and, separately, live network access to Yahoo Finance's
+    endpoints at call time. Tests simulate provider failures so their
+    results do not depend on the runner's network access.
     """
 
     def get_daily_bars(self, symbol: str, start: date, end: date) -> pd.DataFrame:
