@@ -21,9 +21,13 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from pydantic import BaseModel
 
+from api_auth.approvals import ApprovalStore
+from api_auth.fastapi_deps import require
+from api_auth.principals import Principal
+from api_auth.tool_call import authorize_tool_call, build_approval_router
 from rcap_p.config import Config as RcapConfig
 from rcap_p.gateway import RCAPGateway
 
@@ -70,23 +74,25 @@ gated_memory = GatedMemoryWriter(rcap_gateway, memory_store, ledger)
 tts = PolicyEnforcingTTS(LocalTTS(), ElevenLabsCloudTTS())
 
 app = FastAPI(title="Eternal Phase 4 — Voice + Write-Capable Capabilities")
+_approvals = ApprovalStore()
+app.include_router(build_approval_router(_approvals, registry))
 
 
 class ToolCallBody(BaseModel):
     session_id: Optional[str] = None
     tool_name: str
     arguments: Dict[str, Any] = {}
-    confirmation_channel: str = "text_typed"
-    caller_kind: str = "owner_interactive"
+    confirmation_channel: Optional[str] = None   # ignored unless the authenticated principal holds it (audit E-01)
+    caller_kind: Optional[str] = None            # ignored unless it matches the principal
     source_label: str = "http_api"
     explanation: str
     rotate_token: Optional[str] = None
+    approval_id: Optional[str] = None            # required for SENSITIVE tools
 
 
 class ConsentBody(BaseModel):
     tool_name: str
-    granted_by: str = "app_tap"
-    note: str = ""
+    note: str = ""            # `granted_by` is no longer accepted from the caller: it is the authenticated principal
 
 
 class MemoryWriteBody(BaseModel):
@@ -114,22 +120,28 @@ async def healthz():
     return {
         "status": "ok",
         "registered_tools": sorted(registry.keys()),
+        "integration_modes": __import__("mcp_servers.integration_status", fromlist=["integration_modes"]).integration_modes(),
+        "auth_configured": __import__("api_auth.fastapi_deps", fromlist=["get_registry"]).get_registry().configured,
         "ledger_entries": ledger.count(),
         "ledger_source": __import__("voice_consent_gateway.ledger_bridge", fromlist=["SOURCE"]).SOURCE,
     }
 
 
 @app.post("/tools/call")
-async def tools_call(body: ToolCallBody):
+async def tools_call(body: ToolCallBody, principal: Principal = Depends(require("tools:call"))):
+    channel, caller_kind = authorize_tool_call(
+        principal, approvals=_approvals, registry=registry, tool_name=body.tool_name, session_id=body.session_id,
+        arguments=body.arguments, requested_channel=body.confirmation_channel,
+        requested_caller_kind=body.caller_kind, approval_id=body.approval_id)
     request = WriteCallRequest(
         tool_name=body.tool_name,
         arguments=body.arguments,
         session_id=body.session_id,
-        confirmation_channel=ConfirmationChannel(body.confirmation_channel),
+        confirmation_channel=ConfirmationChannel(channel),
         source_label=body.source_label,
         explanation=body.explanation,
         rotate_token=body.rotate_token,
-        caller_kind=body.caller_kind,
+        caller_kind=caller_kind,
     )
     result = await gateway.call_tool(request)
     return {
@@ -141,24 +153,24 @@ async def tools_call(body: ToolCallBody):
 
 
 @app.post("/tools/grant")
-async def tools_grant(session_id: str, tool_name: str):
+async def tools_grant(session_id: str, tool_name: str, principal: Principal = Depends(require("tools:grant"))):
     token = rcap_gateway.grant_tool_permission(session_id, tool_name)
     return {"token": token}
 
 
 @app.post("/consent/grant")
-async def consent_grant(body: ConsentBody):
-    rec = consent_registry.grant(body.tool_name, body.granted_by, body.note)
+async def consent_grant(body: ConsentBody, principal: Principal = Depends(require("consent:write"))):
+    rec = consent_registry.grant(body.tool_name, f"{principal.id}@{principal.default_channel}", body.note)
     return {"tool_name": rec.tool_name, "granted": rec.granted, "granted_by": rec.granted_by}
 
 
 @app.post("/consent/revoke")
-async def consent_revoke(tool_name: str, revoked_by: str = "app_tap"):
-    consent_registry.revoke(tool_name, revoked_by)
+async def consent_revoke(tool_name: str, principal: Principal = Depends(require("consent:write"))):
+    consent_registry.revoke(tool_name, f"{principal.id}@{principal.default_channel}")
     return {"tool_name": tool_name, "granted": False}
 
 
-@app.get("/consent/{tool_name}")
+@app.get("/consent/{tool_name}", dependencies=[Depends(require("consent:read"))])
 async def consent_get(tool_name: str):
     rec = consent_registry.get(tool_name)
     if rec is None:
@@ -166,7 +178,7 @@ async def consent_get(tool_name: str):
     return {"tool_name": rec.tool_name, "granted": rec.granted, "granted_by": rec.granted_by, "granted_at": rec.granted_at}
 
 
-@app.post("/memory/write")
+@app.post("/memory/write", dependencies=[Depends(require("memory:write"))])
 async def memory_write(body: MemoryWriteBody):
     result = gated_memory.write_fact(body.key, body.value, MemoryCategory(body.category), body.source)
     return {
@@ -178,25 +190,25 @@ async def memory_write(body: MemoryWriteBody):
     }
 
 
-@app.post("/memory/approve")
+@app.post("/memory/approve", dependencies=[Depends(require("contain:decide"))])
 async def memory_approve(body: MemoryApproveBody):
     result = gated_memory.approve_pending(body.request_id, body.key, MemoryCategory(body.category), body.source)
     return {"ok": result.ok, "fact": None if result.fact is None else result.fact.__dict__}
 
 
-@app.get("/memory/facts")
+@app.get("/memory/facts", dependencies=[Depends(require("memory:read"))])
 async def memory_facts(category: Optional[str] = None):
     facts = memory_store.list_facts(MemoryCategory(category) if category else None)
     return [f.__dict__ for f in facts]
 
 
-@app.post("/voice/classify")
+@app.post("/voice/classify", dependencies=[Depends(require("voice:use"))])
 async def voice_classify(body: SpeakBody):
     result = classify_outbound(body.text, domain_hint=MemoryCategory(body.domain_hint) if body.domain_hint else None)
     return {"data_class": result.data_class.value, "reasons": result.reasons}
 
 
-@app.post("/voice/speak")
+@app.post("/voice/speak", dependencies=[Depends(require("voice:use"))])
 async def voice_speak(body: SpeakBody):
     result = tts.speak(body.text, domain_hint=MemoryCategory(body.domain_hint) if body.domain_hint else None,
                         requested_backend=body.requested_backend)
@@ -209,7 +221,7 @@ async def voice_speak(body: SpeakBody):
 # --- read-through to RCAP-P's own CONTAIN/ATTRIBUTE/ledger state, so a
 # Phase 4 deployment doesn't need Phase 3's daemon running separately just
 # to inspect what its own shared RCAPGateway instance is doing ---
-@app.get("/contain/pending")
+@app.get("/contain/pending", dependencies=[Depends(require("contain:decide"))])
 async def contain_pending():
     return [
         {"request_id": r.request_id, "tool_name": r.tool_name, "source_label": r.source_label, "reasons": r.reasons}
@@ -217,24 +229,24 @@ async def contain_pending():
     ]
 
 
-@app.post("/contain/{request_id}/approve")
+@app.post("/contain/{request_id}/approve", dependencies=[Depends(require("contain:decide"))])
 async def contain_approve(request_id: str):
     req = rcap_gateway.contain_queue.approve(request_id)
     return {"request_id": req.request_id, "approved": req.approved}
 
 
-@app.post("/contain/{request_id}/reject")
+@app.post("/contain/{request_id}/reject", dependencies=[Depends(require("contain:decide"))])
 async def contain_reject(request_id: str):
     req = rcap_gateway.contain_queue.reject(request_id)
     return {"request_id": req.request_id, "approved": req.approved}
 
 
-@app.get("/ledger")
+@app.get("/ledger", dependencies=[Depends(require("ledger:read"))])
 async def get_ledger(limit: int = 50):
     return ledger.recent(limit)
 
 
-@app.get("/ledger/verify")
+@app.get("/ledger/verify", dependencies=[Depends(require("ledger:read"))])
 async def verify_ledger():
     ok, bad_id = ledger.verify_chain()
     return {"intact": ok, "first_broken_entry_id": bad_id}

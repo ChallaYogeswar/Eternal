@@ -24,8 +24,8 @@ See [docs/PROJECT_TREE.md](docs/PROJECT_TREE.md), [docs/NAMING_GUIDE.md](docs/NA
 From PowerShell:
 
 ```powershell
-Set-Location "C:\Users\chall\Downloads\PROJECTS\ON PROCESS\Eternal AI Assistant\Eternal_final"
-python -m pip install -r requirements.txt
+Set-Location "<path-to-your-Eternal-folder>"
+python -m pip install -r requirements.txt -c constraints.txt
 $env:PYTHONPATH = (Get-Location).Path
 ```
 
@@ -64,6 +64,21 @@ python -m orchestration.validation --run --repeats 3
 The live run can take time under provider rate limits. Reports are written to `validation_reports/`.
 
 ## Local APIs
+
+The RCAP, voice, device-control, trading, and mounted QAP-P APIs require
+authenticated principals. Create an owner token and configure the auth file
+before starting those daemons:
+
+```powershell
+New-Item -ItemType Directory -Force secrets | Out-Null
+$env:ETERNAL_AUTH_FILE = Join-Path (Get-Location).Path "secrets\auth.json"
+python scripts\api_auth\manage_tokens.py add --file $env:ETERNAL_AUTH_FILE --id local-owner --role owner_app
+```
+
+The bearer token is printed once; store it securely. Keep `secrets\` out of
+version control and set `ETERNAL_AUTH_FILE` in each daemon's environment.
+Protected routes fail closed when no principals are configured. The chat API
+is not covered by this auth yet; keep it bound to loopback.
 
 ```powershell
 uvicorn eternal_core.api:app --host 127.0.0.1 --port 8422

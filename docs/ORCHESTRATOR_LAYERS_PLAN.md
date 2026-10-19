@@ -414,10 +414,15 @@ subprocess. True cancellation needs an async gateway path and is scheduled with 
 - Identity: signed envelope (A4). O0 split into O0a / O0b.
 - O0a: contracts, labels, evidence registry, broker (fake gateway), runtime, label-aware model policy
   router + spend reservation, run ledger, unit + invariant tests.
-- O0b: capability issuer/verifier + `AgentCallRequest`, per-run consent, signed external checkpoint.
+- O0b (DONE): capability issuer/verifier + `AgentCallRequest`, per-run consent, signed external checkpoint, crash-safe
+  spend reservations. Deviations: Ed25519 tokens instead of HMAC (public-key-only verifier); the wrapping code lives in
+  a new top-level `agent_chain/` package because the tripwires forbid `orchestration/` from touching the chain.
+  Signer: local Ed25519 under a separate OS user now, phone WebAuthn later. Off-box: second machine over Tailscale +
+  private GitHub repo through `CommandSink`.
 - Red-team: harness and scripted-model tests run in the build sandbox; the real-local-model corpus
   is run on your machine and results shared. The sandbox cannot reach Ollama, and docs will say so.
 - Local model: undecided -> design for a small model (repair retry + degraded path), revisit later.
 
-**Still open:** daily cloud-spend cap value (placeholder 2 USD/day, configurable), checkpoint
-key/off-box location (needed for O0b), Task Issuer reminder mechanism (needed for O5).
+**Still open:** paid no-training provider and daily cloud-spend cap value (placeholder 2 USD/day, configurable), Task
+Issuer reminder mechanism (needed for O5). Decided: INTERNAL-data agents use a paid no-training API; free tiers see
+PUBLIC data only.

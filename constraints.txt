@@ -1,0 +1,21 @@
+# Direct dependencies pinned to the versions the test suite last passed with (audit E-09).
+# Use: pip install -r requirements.txt -c constraints.txt
+cryptography==50.0.1
+PyJWT==2.14.0
+fastapi==0.143.0
+uvicorn==0.53.0
+pydantic==2.13.5
+httpx==0.28.1
+pytest==9.1.1
+pytest-asyncio==1.4.0
+langgraph==1.2.14
+chromadb==1.5.9
+scikit-learn==1.9.1
+python-docx==1.2.0
+mcp==1.29.0
+pyttsx3==2.99
+pandas==3.0.5
+numpy==2.5.3
+kiteconnect==5.2.2
+PyOTP==2.10.0
+yfinance==1.7.0

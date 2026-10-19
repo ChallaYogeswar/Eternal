@@ -16,12 +16,16 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # rcap_p/api.py -> up twice to the project root
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from api_auth.approvals import ApprovalStore
+from api_auth.fastapi_deps import require
+from api_auth.principals import Principal
+from api_auth.tool_call import authorize_tool_call, build_approval_router
 from rcap_p.config import Config
 from rcap_p.deployment import build_default_server_commands
 from rcap_p.gateway import RCAPGateway
@@ -46,12 +50,17 @@ _executor = make_stateless_executor(
 _gateway = RCAPGateway(config=_config, registry=_registry, ledger=_ledger, tool_executor=_executor)
 
 
+_approvals = ApprovalStore()
+app.include_router(build_approval_router(_approvals, _registry))
+
+
 class CallToolRequest(BaseModel):
     session_id: str
     tool_name: str
     arguments: Dict[str, Any] = {}
     rotate_token: Optional[str] = None
-    caller_kind: str = "owner_interactive"  # or "automated_routine"
+    caller_kind: Optional[str] = None       # ignored unless it matches the authenticated principal (audit E-01)
+    approval_id: Optional[str] = None       # required for SENSITIVE tools
     source_label: str = "unspecified"
 
 
@@ -72,11 +81,13 @@ def healthz():
 
 
 @app.post("/tools/call")
-async def call_tool(req: CallToolRequest):
-    try:
-        caller_kind = CallerKind(req.caller_kind)
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"invalid caller_kind '{req.caller_kind}'")
+async def call_tool(req: CallToolRequest, principal: Principal = Depends(require("tools:call"))):
+    # Audit E-01: the caller kind comes from who authenticated, not from the body.
+    _, kind = authorize_tool_call(
+        principal, approvals=_approvals, registry=_registry, tool_name=req.tool_name, session_id=req.session_id,
+        arguments=req.arguments, requested_channel=None, requested_caller_kind=req.caller_kind,
+        approval_id=req.approval_id)
+    caller_kind = CallerKind(kind)
 
     ctx = ToolCallContext(session_id=req.session_id, caller_kind=caller_kind, source_label=req.source_label)
     result = await _gateway.call_tool(ctx, req.tool_name, req.arguments, rotate_token=req.rotate_token)
@@ -92,14 +103,14 @@ async def call_tool(req: CallToolRequest):
 
 
 @app.post("/tools/grant")
-def grant_permission(req: GrantRequest):
+def grant_permission(req: GrantRequest, principal: Principal = Depends(require("tools:grant"))):
     if req.tool_name not in _registry:
         raise HTTPException(status_code=404, detail=f"unknown tool '{req.tool_name}'")
     token = _gateway.grant_tool_permission(req.session_id, req.tool_name)
     return {"token": token, "ttl_seconds": _config.rotate_token_ttl_seconds}
 
 
-@app.get("/contain/pending")
+@app.get("/contain/pending", dependencies=[Depends(require("contain:decide"))])
 def contain_pending():
     return [
         {
@@ -110,7 +121,7 @@ def contain_pending():
     ]
 
 
-@app.post("/contain/{request_id}/approve")
+@app.post("/contain/{request_id}/approve", dependencies=[Depends(require("contain:decide"))])
 def contain_approve(request_id: str):
     try:
         req = _gateway.contain_queue.approve(request_id)
@@ -119,7 +130,7 @@ def contain_approve(request_id: str):
     return {"request_id": req.request_id, "approved": req.approved}
 
 
-@app.post("/contain/{request_id}/reject")
+@app.post("/contain/{request_id}/reject", dependencies=[Depends(require("contain:decide"))])
 def contain_reject(request_id: str):
     try:
         req = _gateway.contain_queue.reject(request_id)
@@ -128,7 +139,7 @@ def contain_reject(request_id: str):
     return {"request_id": req.request_id, "approved": req.approved}
 
 
-@app.get("/attribute/report")
+@app.get("/attribute/report", dependencies=[Depends(require("ledger:read"))])
 def attribute_report():
     return [
         {
@@ -139,12 +150,12 @@ def attribute_report():
     ]
 
 
-@app.get("/ledger")
+@app.get("/ledger", dependencies=[Depends(require("ledger:read"))])
 def ledger_recent(limit: int = 100):
     return _ledger.recent(limit=limit)
 
 
-@app.get("/ledger/verify")
+@app.get("/ledger/verify", dependencies=[Depends(require("ledger:read"))])
 def ledger_verify():
     intact, broken_id = _ledger.verify_chain()
     return {"intact": intact, "first_broken_entry_id": broken_id}

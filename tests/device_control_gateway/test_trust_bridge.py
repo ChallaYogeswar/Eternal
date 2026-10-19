@@ -52,17 +52,15 @@ def test_quarantined_session_state_reflects_in_lookup(trust_lookup, enroll_and_a
     assert trust_lookup.get_session_state(session_id) == "QUARANTINE"
 
 
-def test_hardware_backed_reports_true_for_any_enrolled_device(trust_lookup, enroll_and_activate):
-    """Phase 1's own enroll_device (checked directly, not assumed) sets
-    hardware_backed=True unconditionally for every device, including one
-    using SimulatedHardwareKey — the real/simulated distinction lives only
-    in the attestation_type STRING ('simulated-dev-key (NOT hardware-
-    backed...)'), not in this boolean field. QapPTrustLookup.
-    is_hardware_backed faithfully reports whatever Phase 1 actually
-    stores; it does not (and should not) second-guess it. See
-    device_control_gateway/trust_tier.py's module docstring for what this means for the
-    top-trust-tier gate's real-world strength today versus once Phase 1's
-    hardware-attestation seam is filled in for real."""
+def test_enrolled_device_is_not_hardware_backed_without_verified_attestation(trust_lookup, enroll_and_activate):
+    """Audit E-02: a simulated key must never be reported hardware-backed. The default verifier is fail-closed."""
     device, session_id = enroll_and_activate()
-    assert trust_lookup.is_hardware_backed(device.device_id) is True
-    assert "NOT hardware-backed" in device.attestation_type
+    assert device.hardware_backed is False
+    assert trust_lookup.is_hardware_backed(device.device_id) is False
+
+
+def test_hardware_backed_true_only_when_a_verifier_says_so(attested_orchestrator):
+    from device_control_gateway.trust_bridge import QapPTrustLookup
+    from qap_p.models import DeviceRole
+    d = attested_orchestrator.enroll_device("dev-att", DeviceRole("laptop"))
+    assert QapPTrustLookup(attested_orchestrator).is_hardware_backed(d.device_id) is True

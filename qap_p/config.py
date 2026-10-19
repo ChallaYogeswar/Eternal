@@ -40,6 +40,13 @@ class Config:
     # never one master key; build plan Section 3 "Security infrastructure").
     default_token_ttl_seconds: float = float(os.environ.get("QAP_TOKEN_TTL", 300))
 
+    # Audit E-01: upper bound for a vault token lifetime requested over the API.
+    max_token_ttl_seconds: float = float(os.environ.get("QAP_MAX_TOKEN_TTL", 3600))
+
+    # Audit E-02: when True, enrollment is refused unless a platform attestation verifier validated the device.
+    # Default False because no real verifier ships yet; hardware_backed is still False for unverified devices either way.
+    require_verified_attestation: bool = os.environ.get("QAP_REQUIRE_ATTESTATION", "0") == "1"
+
     # Local-first storage only (build plan Section 5.1) — no cloud dependency
     # for the trust substrate itself.
     data_dir: str = os.environ.get("QAP_DATA_DIR", "./data")

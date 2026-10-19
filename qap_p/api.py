@@ -13,8 +13,12 @@ import threading
 import time
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+import re
+
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
+
+from api_auth.fastapi_deps import require
 
 from .orchestrator import Orchestrator
 from .models import DeviceRole
@@ -104,7 +108,7 @@ class CanaryCheckRequest(BaseModel):
 
 # ---------- endpoints ----------
 
-@app.post("/devices/enroll")
+@app.post("/devices/enroll", dependencies=[Depends(require("qap:admin"))])
 def enroll_device(req: EnrollRequest):
     try:
         role = DeviceRole(req.role)
@@ -138,7 +142,7 @@ def enroll_device(req: EnrollRequest):
     }
 
 
-@app.get("/devices/{device_id}/trust-score")
+@app.get("/devices/{device_id}/trust-score", dependencies=[Depends(require("qap:read"))])
 def get_trust_score(device_id: str):
     try:
         score = orchestrator.compute_trust_score(device_id)
@@ -147,7 +151,7 @@ def get_trust_score(device_id: str):
     return {"device_id": device_id, "trust_score": score}
 
 
-@app.post("/sessions")
+@app.post("/sessions", dependencies=[Depends(require("qap:write"))])
 def create_session(device_id: str):
     try:
         session_id = orchestrator.create_session(device_id)
@@ -156,7 +160,7 @@ def create_session(device_id: str):
     return {"session_id": session_id, "state": "ACTIVE"}
 
 
-@app.get("/sessions/{session_id}")
+@app.get("/sessions/{session_id}", dependencies=[Depends(require("qap:read"))])
 def get_session(session_id: str):
     try:
         state = orchestrator.get_session_state(session_id)
@@ -165,7 +169,7 @@ def get_session(session_id: str):
     return {"session_id": session_id, "state": state.value}
 
 
-@app.post("/sessions/{session_id}/quiesce")
+@app.post("/sessions/{session_id}/quiesce", dependencies=[Depends(require("qap:write"))])
 def quiesce(session_id: str, req: QuiesceRequest):
     try:
         state = orchestrator.quiesce_session(session_id, req.dict())
@@ -174,7 +178,7 @@ def quiesce(session_id: str, req: QuiesceRequest):
     return {"session_id": session_id, "state": state.value}
 
 
-@app.post("/sessions/{session_id}/quarantine")
+@app.post("/sessions/{session_id}/quarantine", dependencies=[Depends(require("qap:write"))])
 def quarantine(session_id: str, req: QuarantineRequest):
     try:
         state = orchestrator.quarantine_session(session_id, req.reason)
@@ -183,7 +187,7 @@ def quarantine(session_id: str, req: QuarantineRequest):
     return {"session_id": session_id, "state": state.value}
 
 
-@app.post("/authorize/challenge")
+@app.post("/authorize/challenge", dependencies=[Depends(require("qap:write"))])
 def authorize_challenge(req: ChallengeRequest):
     try:
         nonce = orchestrator.request_authorization_challenge(req.target_session_id)
@@ -192,7 +196,7 @@ def authorize_challenge(req: ChallengeRequest):
     return {"nonce": nonce}
 
 
-@app.post("/authorize")
+@app.post("/authorize", dependencies=[Depends(require("qap:write"))])
 def authorize(req: AuthorizeRequest):
     try:
         signature = base64.b64decode(req.signature_b64)
@@ -209,7 +213,7 @@ def authorize(req: AuthorizeRequest):
     return {"authorization_token": token}
 
 
-@app.post("/sessions/{session_id}/revive")
+@app.post("/sessions/{session_id}/revive", dependencies=[Depends(require("qap:admin"))])
 def revive(session_id: str, req: ReviveRequest):
     try:
         state = orchestrator.revive_session(session_id, req.authorization_token)
@@ -218,7 +222,7 @@ def revive(session_id: str, req: ReviveRequest):
     return {"session_id": session_id, "state": state.value}
 
 
-@app.post("/sessions/{session_id}/recovery/soft")
+@app.post("/sessions/{session_id}/recovery/soft", dependencies=[Depends(require("qap:admin"))])
 def recovery_soft(session_id: str, req: SoftRecoveryRequest):
     try:
         ok = orchestrator.recover_soft(
@@ -231,7 +235,7 @@ def recovery_soft(session_id: str, req: SoftRecoveryRequest):
     return {"session_id": session_id, "state": "ACTIVE"}
 
 
-@app.post("/sessions/{session_id}/recovery/hard")
+@app.post("/sessions/{session_id}/recovery/hard", dependencies=[Depends(require("qap:admin"))])
 def recovery_hard(session_id: str, req: HardRecoveryRequest):
     ok = orchestrator.recover_hard(session_id, req.presented_key)
     if not ok:
@@ -239,13 +243,24 @@ def recovery_hard(session_id: str, req: HardRecoveryRequest):
     return {"session_id": session_id, "state": "ACTIVE"}
 
 
-@app.post("/vault/tokens")
+_SCOPE_RE = re.compile(r"^[a-z0-9_:.\-]{1,64}$")
+
+
+@app.post("/vault/tokens", dependencies=[Depends(require("qap:admin"))])
 def issue_token(req: TokenRequest):
+    # Audit E-01: validate scope, cap the lifetime, and only issue for devices that exist.
+    if not _SCOPE_RE.match(req.scope):
+        raise HTTPException(400, "scope must match [a-z0-9_:.-]{1,64}")
+    cap = orchestrator.config.max_token_ttl_seconds
+    if req.ttl_seconds is not None and not (0 < req.ttl_seconds <= cap):
+        raise HTTPException(400, f"ttl_seconds must be in (0, {cap}]")
+    if orchestrator.get_device(req.device_id) is None:
+        raise HTTPException(404, "unknown device")
     token = orchestrator.issue_token(req.device_id, req.scope, req.ttl_seconds)
     return {"token": token}
 
 
-@app.post("/vault/tokens/verify")
+@app.post("/vault/tokens/verify", dependencies=[Depends(require("qap:read"))])
 def verify_token(req: TokenVerifyRequest):
     try:
         payload = orchestrator.verify_token(req.token)
@@ -254,35 +269,36 @@ def verify_token(req: TokenVerifyRequest):
     return payload
 
 
-@app.post("/canary/plant")
+@app.post("/canary/plant", dependencies=[Depends(require("qap:admin"))])
 def plant_canary():
     value = orchestrator.plant_canary()
     return {"canary_value": value}
 
 
-@app.post("/canary/check")
+@app.post("/canary/check", dependencies=[Depends(require("qap:write"))])
 def check_canary(req: CanaryCheckRequest):
     triggered = orchestrator.check_canary(req.presented_value, req.accessor_session_id)
     return {"triggered": triggered}
 
 
-@app.post("/chaos/run")
+@app.post("/chaos/run", dependencies=[Depends(require("qap:admin"))])
 def run_chaos(target_session_id: str):
     results = orchestrator.run_chaos_suite(target_session_id)
     return {"results": results}
 
 
-@app.get("/ledger/verify")
+@app.get("/ledger/verify", dependencies=[Depends(require("ledger:read"))])
 def ledger_verify():
     ok, bad_id = orchestrator.verify_ledger()
     return {"intact": ok, "first_broken_entry_id": bad_id}
 
 
-@app.get("/ledger")
+@app.get("/ledger", dependencies=[Depends(require("ledger:read"))])
 def ledger_recent(limit: int = 100):
     return {"entries": orchestrator.ledger_entries(limit)}
 
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    from api_auth.fastapi_deps import get_registry
+    return {"status": "ok", "auth_configured": get_registry().configured}

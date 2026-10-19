@@ -25,9 +25,13 @@ import os as _os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from pydantic import BaseModel
 
+from api_auth.approvals import ApprovalStore
+from api_auth.fastapi_deps import require
+from api_auth.principals import Principal
+from api_auth.tool_call import authorize_tool_call, build_approval_router
 from voice_consent_gateway.config import Config as Phase4Config
 from voice_consent_gateway.consent import ConsentRegistry
 from voice_consent_gateway.gateway import Phase4Gateway
@@ -92,14 +96,17 @@ gateway = Phase6Gateway(phase5_gateway, top_trust_tier_gate, live_trading_gate, 
 
 app = FastAPI(title="Eternal Phase 6 — Algorithmic Trading")
 app.mount("/qap", qap_app)
+_approvals = ApprovalStore()
+app.include_router(build_approval_router(_approvals, registry))
 
 
 class ToolCallBody(BaseModel):
     session_id: Optional[str] = None
     tool_name: str
     arguments: Dict[str, Any] = {}
-    confirmation_channel: str = "text_typed"
-    caller_kind: str = "owner_interactive"
+    confirmation_channel: Optional[str] = None   # ignored unless the authenticated principal holds it (audit E-01)
+    caller_kind: Optional[str] = None            # ignored unless it matches the principal
+    approval_id: Optional[str] = None            # required for SENSITIVE tools
     source_label: str = "http_api"
     explanation: str
     rotate_token: Optional[str] = None
@@ -114,6 +121,8 @@ async def healthz():
     return {
         "status": "ok",
         "registered_tools": sorted(registry.keys()),
+        "integration_modes": __import__("mcp_servers.integration_status", fromlist=["integration_modes"]).integration_modes(),
+        "auth_configured": __import__("api_auth.fastapi_deps", fromlist=["get_registry"]).get_registry().configured,
         "ledger_entries": ledger.count(),
         "ledger_source": __import__("trading_risk_engine.ledger_bridge", fromlist=["SOURCE"]).SOURCE,
         "live_trading_enabled": config.live_trading_enabled,
@@ -122,12 +131,16 @@ async def healthz():
 
 
 @app.post("/tools/call")
-async def tools_call(body: ToolCallBody):
+async def tools_call(body: ToolCallBody, principal: Principal = Depends(require("tools:call"))):
+    channel, caller_kind = authorize_tool_call(
+        principal, approvals=_approvals, registry=registry, tool_name=body.tool_name, session_id=body.session_id,
+        arguments=body.arguments, requested_channel=body.confirmation_channel,
+        requested_caller_kind=body.caller_kind, approval_id=body.approval_id)
     request = WriteCallRequest(
         tool_name=body.tool_name, arguments=body.arguments, session_id=body.session_id,
-        confirmation_channel=ConfirmationChannel(body.confirmation_channel),
+        confirmation_channel=ConfirmationChannel(channel),
         source_label=body.source_label, explanation=body.explanation,
-        rotate_token=body.rotate_token, caller_kind=body.caller_kind,
+        rotate_token=body.rotate_token, caller_kind=caller_kind,
     )
     result = await gateway.call_tool(request)
     return {
@@ -137,7 +150,7 @@ async def tools_call(body: ToolCallBody):
 
 
 @app.post("/tools/grant")
-async def tools_grant(session_id: str, tool_name: str):
+async def tools_grant(session_id: str, tool_name: str, principal: Principal = Depends(require("tools:grant"))):
     try:
         token = gateway.grant_tool_permission(session_id, tool_name)
     except ValueError as e:
@@ -146,18 +159,19 @@ async def tools_grant(session_id: str, tool_name: str):
 
 
 @app.post("/consent/grant")
-async def consent_grant(tool_name: str, granted_by: str = "app_tap", note: str = ""):
-    rec = consent_registry.grant(tool_name, granted_by, note)
+async def consent_grant(tool_name: str, note: str = "", principal: Principal = Depends(require("consent:write"))):
+    # Audit E-01: `granted_by` is the authenticated principal, no longer a caller-supplied string.
+    rec = consent_registry.grant(tool_name, f"{principal.id}@{principal.default_channel}", note)
     return {"tool_name": rec.tool_name, "granted": rec.granted, "granted_by": rec.granted_by}
 
 
-@app.get("/trust/{session_id}/top-tier")
+@app.get("/trust/{session_id}/top-tier", dependencies=[Depends(require("qap:read"))])
 async def trust_top_tier(session_id: str):
     decision = top_trust_tier_gate.check(session_id)
     return {"granted": decision.granted, "reason": decision.reason, "trust_score": decision.trust_score}
 
 
-@app.get("/trading/live-readiness")
+@app.get("/trading/live-readiness", dependencies=[Depends(require("trading:read"))])
 async def trading_live_readiness():
     """One call answering 'could a live order even be attempted right
     now, ignoring session/trust entirely' — the regulatory half of the
@@ -167,7 +181,7 @@ async def trading_live_readiness():
     return {"allowed": result.allowed, "reason": result.reason, "live_trading_enabled": config.live_trading_enabled}
 
 
-@app.post("/kill_switch")
+@app.post("/kill_switch", dependencies=[Depends(require("kill:trigger"))])
 async def kill_switch(body: KillSwitchBody):
     report = phase5_gateway.pull_kill_switch(reason=body.reason)
     return {
@@ -180,12 +194,12 @@ async def kill_switch(body: KillSwitchBody):
     }
 
 
-@app.get("/ledger")
+@app.get("/ledger", dependencies=[Depends(require("ledger:read"))])
 async def ledger_recent(limit: int = 50):
     return ledger.recent(limit)
 
 
-@app.get("/ledger/verify")
+@app.get("/ledger/verify", dependencies=[Depends(require("ledger:read"))])
 async def ledger_verify():
     intact, break_index = ledger.verify_chain()
     return {"intact": intact, "break_index": break_index}

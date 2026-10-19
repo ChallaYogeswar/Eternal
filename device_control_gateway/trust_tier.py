@@ -30,23 +30,10 @@ session/device/hardware checks (same shape FastlaneGate already
 established — see rcap_p/fastlane.py), and the plumbing to call it from
 Phase 5's own gateway, without modifying qap_p or rcap_p at all.
 
-Honest caveat, found while writing this module's tests, not assumed:
-qap_p.orchestrator.Orchestrator.enroll_device (checked directly) sets
-Device.hardware_backed=True unconditionally for every device, whether it
-was enrolled with a real platform key or Phase 1's SimulatedHardwareKey —
-the real/simulated distinction lives only in the human-readable
-attestation_type STRING, not in this boolean. That means the
-is_hardware_backed check below currently passes for any enrolled device,
-not only genuinely hardware-attested ones — the actual bar today is
-carried entirely by the trust-SCORE threshold (0.85), which is real and
-does correctly refuse a freshly-enrolled device (score 0.40, confirmed
-live against a running daemon). This is a Phase-1-level characteristic,
-not something to silently paper over here or fix by modifying Phase 1's
-already-validated code; it will resolve itself once Phase 1's own
-documented hardware-key seam is filled with a real platform provider
-(qap_p/hardware_key.py's module docstring already names this as future
-work). Flagged here because it materially affects how much of this
-gate's strength comes from "hardware-backed" versus "trust score" today.
+Audit E-02 (fixed): `Device.hardware_backed` used to be set True for every enrolled device, so the hardware check
+below passed for simulated and client-supplied keys. It is now set only from a verified platform attestation
+(`qap_p.attestation.AttestationVerifier`, fail-closed by default). Until a real verifier is installed NO device is
+hardware-backed, so this gate refuses full device control for everyone: the honest state, not a bug.
 """
 from dataclasses import dataclass
 from typing import Optional

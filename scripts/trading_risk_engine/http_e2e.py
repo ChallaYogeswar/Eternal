@@ -22,6 +22,18 @@ import uuid
 
 import httpx
 
+# Audit E-01: the daemon now requires a bearer token. Create one with scripts/api_auth/manage_tokens.py (role
+# owner_app), start the daemon with ETERNAL_AUTH_FILE set, and export ETERNAL_API_TOKEN for this script. The script
+# no longer sends `granted_by` / channel / caller kind: the server derives them from the token.
+import os as _os
+_TOKEN = _os.environ.get("ETERNAL_API_TOKEN")
+if not _TOKEN:
+    raise SystemExit("set ETERNAL_API_TOKEN to an owner_app bearer token (see scripts/api_auth/manage_tokens.py)")
+_AUTH = {"Authorization": f"Bearer {_TOKEN}"}
+_get, _post = httpx.get, httpx.post
+httpx.get = lambda url, **kw: _get(url, headers={**_AUTH, **kw.pop("headers", {})}, **kw)
+httpx.post = lambda url, **kw: _post(url, headers={**_AUTH, **kw.pop("headers", {})}, **kw)
+
 BASE = "http://127.0.0.1:8424"
 
 _passed = 0

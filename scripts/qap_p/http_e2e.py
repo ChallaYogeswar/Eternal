@@ -23,7 +23,11 @@ BASE = "http://127.0.0.1:8421"
 
 
 def main():
-    client = httpx.Client(base_url=BASE, timeout=10)
+    import os
+    _tok = os.environ.get("ETERNAL_API_TOKEN")
+    if not _tok:
+        raise SystemExit("set ETERNAL_API_TOKEN to an owner_app bearer token (audit E-01; see scripts/api_auth/manage_tokens.py)")
+    client = httpx.Client(base_url=BASE, timeout=10, headers={"Authorization": f"Bearer {_tok}"})
 
     phone_key = SimulatedHardwareKey()
     laptop_key = SimulatedHardwareKey()

@@ -32,7 +32,7 @@ class ConsentPort(Protocol):
 
 
 class NoWriteConsent:
-    """Fail-closed default: no WRITE call is ever approved. (Per-run grants arrive in O0b.)"""
+    """Fail-closed default: no WRITE call is ever approved. Real per-run grants: orchestration.consent.ConsentStore."""
     def check(self, tool_name: str, run_id: str) -> str:
         return "pending"
 
@@ -106,7 +106,8 @@ class ToolBroker:
     def __init__(self, *, spec: AgentSpec, catalog: Dict[str, ToolInfo], gateway: Any, session_id: str,
                  run_id: str, evidence: EvidenceRegistry, consent: Optional[ConsentPort] = None,
                  rotate_token_provider: Optional[Callable[[str], Optional[str]]] = None,
-                 session_alive: Optional[Callable[[], bool]] = None, origin_channel: str = "typed"):
+                 session_alive: Optional[Callable[[], bool]] = None, origin_channel: str = "typed",
+                 token_provider: Optional[Callable[[], Optional[str]]] = None):
         validate_spec_against_catalog(spec, catalog)
         self.spec, self.catalog, self._gateway = spec, catalog, gateway
         self.session_id, self.run_id, self.evidence = session_id, run_id, evidence
@@ -114,6 +115,7 @@ class ToolBroker:
         self._rotate = rotate_token_provider or (lambda tool: None)
         self._alive = session_alive or (lambda: True)
         self.origin_channel = origin_channel
+        self._token = token_provider            # opaque capability token; never shown to the model
         self.calls = 0
         self.denials = 0
         self._repeat: Dict[str, int] = {}
@@ -168,6 +170,11 @@ class ToolBroker:
                                      pending_tool=tool)
             if decision != "granted":
                 return self._deny("consent_denied")
+        token = None
+        if self._token is not None:
+            token = self._token()
+            if not token:
+                return self._deny("no_capability_token")
         if not self._alive():                       # TOCTOU: re-check immediately before dispatch (I9)
             return self._killed()
 
@@ -178,6 +185,8 @@ class ToolBroker:
             confirmation_channel="voice" if self.origin_channel == "voice" else "automated",
             caller_kind=CALLER_KIND, rotate_token=self._rotate(tool),
         )
+        if token is not None:
+            kwargs["capability_token"] = token
         try:
             raw = call_with_timeout(lambda: self._gateway.call_tool(**kwargs), b.per_call_timeout_s)
         except CallTimeout:

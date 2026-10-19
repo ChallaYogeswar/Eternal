@@ -156,8 +156,15 @@ class FOPaperBroker:
             )
             return self._record_order(conn, contract.display_symbol, side, num_lots, price, "FILLED")
 
-    def close_position(self, position_id: str, exit_price: str) -> Optional[float]:
-        """Returns the realized P&L, or None if no such position exists."""
+    def close_position(self, position_id: str, exit_price: float) -> Optional[float]:
+        """Returns the realized P&L, or None if no such position exists.
+
+        Audit E-10: `exit_price` used to be annotated `str` while the body does arithmetic on it. It must be a positive,
+        finite number; anything else is a ValueError before any state is touched."""
+        import math
+        if isinstance(exit_price, bool) or not isinstance(exit_price, (int, float)) \
+                or not math.isfinite(exit_price) or exit_price <= 0:
+            raise ValueError(f"exit_price must be a positive finite number, got {exit_price!r}")
         with self._conn() as conn:
             row = conn.execute("SELECT * FROM fo_positions WHERE position_id = ?", (position_id,)).fetchone()
             if row is None:

@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from ._timeout import CallTimeout, call_with_timeout
 from .broker import BrokerFactory, ConsentPort, ToolBroker
+from .capability import CapabilityHandle, CapabilityPort
 from .contracts import (AgentResult, AgentSpec, Finding, Labels, RunStatus, StepRecord, Task, ToolInfo)
 from .evidence import EvidenceRegistry, reconcile_findings
 from .labels import LabelViolation, check_spec_ceiling, guard_join, wrap_untrusted
@@ -43,6 +44,10 @@ _ACTION = TypeAdapter(Union[ToolRequest, FinalAnswer])
 
 
 class ActionParseError(ValueError):
+    pass
+
+
+class _NoAuthority(Exception):
     pass
 
 
@@ -88,7 +93,10 @@ class AgentRunner:
     def __init__(self, spec: AgentSpec, model: PolicyRouter, brokers: BrokerFactory,
                  ledger: RunLedger, *, consent: Optional[ConsentPort] = None,
                  rotate_token_provider: Optional[Callable[[str], Optional[str]]] = None,
-                 session_alive: Optional[Callable[[], bool]] = None, clock: Callable[[], float] = time.monotonic):
+                 session_alive: Optional[Callable[[], bool]] = None, clock: Callable[[], float] = time.monotonic,
+                 capability: Optional[CapabilityPort] = None, checkpoints: Optional[Any] = None):
+        self.capability = capability
+        self.checkpoints = checkpoints          # CheckpointWriter: signs ledger head + count at the end of every run
         self.spec, self.model, self.brokers = spec, model, brokers
         self.catalog = brokers.catalog
         self.ledger, self.consent, self._rotate = ledger, consent, rotate_token_provider
@@ -119,10 +127,27 @@ class AgentRunner:
         evidence = EvidenceRegistry()
         result = AgentResult(run_id=task.run_id, agent=spec.name, status=RunStatus.FAILED,
                              labels=task.labels, spec_hash=spec.spec_hash)
+        handle: Optional[CapabilityHandle] = None
+        origin = origin_channel or task.origin_channel
         try:
-            self._execute(task, session_id, origin_channel or task.origin_channel, evidence, result)
+            if self.capability is not None:
+                try:
+                    handle = self.capability.begin(spec=spec, task=task, session_id=session_id, origin_channel=origin)
+                except Exception as e:  # noqa: BLE001 — no authority, no run (fail closed)
+                    result.status, result.detail = RunStatus.REFUSED, f"capability_unavailable:{type(e).__name__}"
+                    handle = None
+                    raise _NoAuthority() from e
+            self._execute(task, session_id, origin, evidence, result, handle)
+        except _NoAuthority:
+            pass
         except Exception as e:  # noqa: BLE001 — a run must never raise into the caller
             result.status, result.detail = RunStatus.FAILED, f"internal_error:{type(e).__name__}"
+        finally:
+            if handle is not None:
+                try:
+                    handle.close()                     # authority ends with the run, however it ended
+                except Exception:  # noqa: BLE001
+                    pass
         result.evidence_ids = evidence.view().ids()
         try:
             self.ledger.append("agent_run_finished", {
@@ -132,22 +157,33 @@ class AgentRunner:
                 "rejected_findings": result.rejected_findings, "labels": result.labels.to_dict()})
         except Exception:  # noqa: BLE001 — ledger failure: fail closed, drop any output
             result.status, result.output, result.detail = RunStatus.FAILED, None, "ledger_unavailable"
+        if self.checkpoints is not None:
+            try:
+                self.checkpoints.write()               # best effort; failures are recorded by the writer itself
+            except Exception:  # noqa: BLE001
+                pass
         return result
 
     def _log_step(self, task: Task, step: StepRecord) -> None:
         self.ledger.append("agent_step", {"run_id": task.run_id, "agent": self.spec.name, **step.__dict__})
 
     def _execute(self, task: Task, session_id: str, origin: str, evidence: EvidenceRegistry,
-                 result: AgentResult) -> None:
+                 result: AgentResult, handle: Optional[CapabilityHandle] = None) -> None:
         spec, b = self.spec, self.spec.budget
         t0 = self.clock()
+        extra = {}
+        rotate = self._rotate
+        if handle is not None:
+            extra["token_provider"] = lambda: handle.token
+            rotate = handle.rotate_token
         broker = self.brokers.make(spec=spec, session_id=session_id, run_id=task.run_id, evidence=evidence,
-                                   consent=self.consent, rotate_token_provider=self._rotate,
-                                   session_alive=self._alive, origin_channel=origin)
+                                   consent=self.consent, rotate_token_provider=rotate,
+                                   session_alive=self._alive, origin_channel=origin, **extra)
         self.ledger.append("agent_run_started", {
             "run_id": task.run_id, "agent": spec.name, "spec_hash": spec.spec_hash,
             "goal": task.goal[:300], "origin_channel": origin, "labels": task.labels.to_dict(),
-            "allowed_tools": sorted(spec.allowed_tools)})
+            "allowed_tools": sorted(spec.allowed_tools),
+            **({"capability": handle.summary()} if handle is not None else {})})
 
         if not self._alive():
             result.status, result.detail = RunStatus.KILLED, "session not active at start"
@@ -174,7 +210,8 @@ class AgentRunner:
             step_start = self.clock()
             try:
                 reply = call_with_timeout(
-                    lambda: self.model.generate(system, list(messages), ctx, spec.model_policy, prompt_tokens),
+                    lambda: self.model.generate(system, list(messages), ctx, spec.model_policy, prompt_tokens,
+                                        run_id=task.run_id, agent=spec.name),
                     b.per_call_timeout_s)
             except SpendCapExceeded as e:
                 result.status, result.detail = RunStatus.BUDGET_EXHAUSTED, f"spend_cap: {e}"

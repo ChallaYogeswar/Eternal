@@ -32,8 +32,7 @@ def test_freshly_enrolled_device_does_not_clear_the_bar(top_trust_tier_gate, enr
     device, session_id = enroll_and_activate()
     decision = top_trust_tier_gate.check(session_id)
     assert decision.granted is False
-    assert decision.trust_score is not None
-    assert decision.trust_score < 0.85
+    assert "hardware" in decision.reason          # refused at the hardware check now, before the score is even read
 
 
 def test_quarantined_session_denied(top_trust_tier_gate, enroll_and_activate, orchestrator):
@@ -85,3 +84,35 @@ def test_high_trust_device_clears_the_bar(top_trust_tier_gate, orchestrator, pha
     decision = top_trust_tier_gate.check(session_id)
     assert decision.granted is True
     assert decision.trust_score == score
+
+
+def test_simulated_key_never_clears_the_hardware_gate_regardless_of_score(phase5_config, orchestrator, trust_lookup):
+    """Audit E-02 regression: even a long-standing, zero-incident device with a high trust score is refused when its
+    key was never verified as hardware-backed."""
+    import time
+    from device_control_gateway.trust_tier import TopTrustTierGate
+    from qap_p.models import DeviceRole
+    d = orchestrator.enroll_device("old-dev", DeviceRole("laptop"))
+    import sqlite3
+    c = sqlite3.connect(orchestrator.config.db_path)
+    c.execute("UPDATE devices SET enrolled_at=? WHERE device_id=?", (time.time() - 400 * 86400, "old-dev"))
+    c.commit(); c.close()
+    sid = orchestrator.create_session("old-dev")
+    assert orchestrator.compute_trust_score("old-dev") > 0.7        # high score; only the hardware factor is missing
+    decision = TopTrustTierGate(phase5_config, trust_lookup).check(sid)
+    assert decision.granted is False and "hardware" in decision.reason
+
+
+def test_verified_hardware_with_high_score_can_clear_the_gate(phase5_config, attested_orchestrator):
+    import sqlite3, time
+    from device_control_gateway.trust_bridge import QapPTrustLookup
+    from device_control_gateway.trust_tier import TopTrustTierGate
+    from qap_p.models import DeviceRole
+    o = attested_orchestrator
+    o.enroll_device("hw-dev", DeviceRole("laptop"))
+    c = sqlite3.connect(o.config.db_path)
+    c.execute("UPDATE devices SET enrolled_at=? WHERE device_id=?", (time.time() - 400 * 86400, "hw-dev"))
+    c.commit(); c.close()
+    sid = o.create_session("hw-dev")
+    decision = TopTrustTierGate(phase5_config, QapPTrustLookup(o)).check(sid)
+    assert decision.granted is True, decision.reason

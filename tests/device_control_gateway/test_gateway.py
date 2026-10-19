@@ -30,7 +30,7 @@ async def test_full_control_denied_for_low_trust_session_before_reaching_rcap_p(
     _, session_id = enroll_and_activate()
     result = await phase5_gateway.call_tool(_request(FULL_CONTROL_TOOL_NAME, session_id))
     assert result.ok is False
-    assert "trust score" in result.denied_reason
+    assert "hardware" in result.denied_reason or "trust score" in result.denied_reason
     assert fake_executor.calls == []  # never reached the tool
 
 

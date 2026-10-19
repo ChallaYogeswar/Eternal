@@ -156,38 +156,58 @@ class CloudEntry:
 
 
 class SpendLedger:
-    """Daily (UTC) cloud-spend accounting with atomic reserve-before-call (BEGIN IMMEDIATE)."""
+    """Daily (UTC) cloud-spend accounting with atomic reserve-before-call (BEGIN IMMEDIATE).
 
-    def __init__(self, db_path: str, daily_cap_usd: float):
+    Two APIs share one daily total:
+      * legacy `reserve(amount)` / `adjust(delta)`: anonymous, kept for callers that only need the cap;
+      * reservations (`open` -> `mark_sent` -> `settle` | `release`): each has an id, a run and agent, a state, and
+        survives a crash. A crash can leave a reservation open, and `reap` resolves it honestly: if the request was
+        never sent it is released (provably nothing was spent); if it WAS sent and we never heard back it stays
+        counted as `unknown` (we cannot prove it was free), and a late `settle` from an abandoned worker thread
+        corrects it. `settle`/`release` are idempotent, so a thread abandoned by a timeout can finish safely.
+    """
+
+    OPEN_STATES = ("reserved", "sent")
+
+    def __init__(self, db_path: str, daily_cap_usd: float, clock=None):
         self.db_path = db_path
         self.cap = daily_cap_usd
+        self._clock = clock or time.time
         with self._conn() as c:
             c.execute("CREATE TABLE IF NOT EXISTS spend (day TEXT PRIMARY KEY, total REAL NOT NULL)")
+            c.execute("CREATE TABLE IF NOT EXISTS reservations ("
+                      "id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, run_id TEXT, agent TEXT, provider TEXT, "
+                      "amount REAL NOT NULL, actual REAL, state TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL)")
 
     def _conn(self):
         c = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         return _Closing(c)
 
-    @staticmethod
-    def _today() -> str:
-        return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+    def _today(self) -> str:
+        return self._day_of(self._clock())
 
+    def _day_of(self, ts: float) -> str:
+        return _dt.datetime.fromtimestamp(ts, _dt.timezone.utc).strftime("%Y-%m-%d")
+
+    def _check_and_add(self, c, day: str, amount: float) -> None:
+        row = c.execute("SELECT total FROM spend WHERE day=?", (day,)).fetchone()
+        total = row[0] if row else 0.0
+        if total + amount > self.cap:
+            raise SpendCapExceeded(
+                f"daily cloud-spend cap {self.cap:.2f} USD would be exceeded "
+                f"(spent/reserved {total:.4f} + {amount:.4f})")
+        c.execute("INSERT INTO spend(day,total) VALUES(?,?) ON CONFLICT(day) DO UPDATE SET total=total+excluded.total",
+                  (day, amount))
+
+    # -- legacy API ------------------------------------------------------------------------------------
     def reserve(self, amount: float) -> float:
         with self._conn() as c:
             c.execute("BEGIN IMMEDIATE")
             try:
-                row = c.execute("SELECT total FROM spend WHERE day=?", (self._today(),)).fetchone()
-                total = row[0] if row else 0.0
-                if total + amount > self.cap:
-                    c.execute("ROLLBACK")
-                    raise SpendCapExceeded(
-                        f"daily cloud-spend cap {self.cap:.2f} USD would be exceeded "
-                        f"(spent/reserved {total:.4f} + {amount:.4f})")
-                c.execute("INSERT INTO spend(day,total) VALUES(?,?) "
-                          "ON CONFLICT(day) DO UPDATE SET total=total+excluded.total",
-                          (self._today(), amount))
+                self._check_and_add(c, self._today(), amount)
                 c.execute("COMMIT")
             except SpendCapExceeded:
+                c.execute("ROLLBACK")
                 raise
             except Exception:
                 c.execute("ROLLBACK")
@@ -199,6 +219,93 @@ class SpendLedger:
             c.execute("BEGIN IMMEDIATE")
             c.execute("UPDATE spend SET total=MAX(0,total+?) WHERE day=?", (delta, self._today()))
             c.execute("COMMIT")
+
+    # -- reservations ----------------------------------------------------------------------------------
+    def open(self, amount: float, *, run_id=None, agent=None, provider=None) -> int:
+        now = self._clock()
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                day = self._day_of(now)
+                self._check_and_add(c, day, amount)
+                cur = c.execute("INSERT INTO reservations(day,run_id,agent,provider,amount,state,created,updated) "
+                                "VALUES(?,?,?,?,?,'reserved',?,?)", (day, run_id, agent, provider, amount, now, now))
+                rid = cur.lastrowid
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        return rid
+
+    def mark_sent(self, rid: int) -> None:
+        """Call immediately before the network request: from here on the money may be spent."""
+        with self._conn() as c:
+            c.execute("UPDATE reservations SET state='sent', updated=? WHERE id=? AND state='reserved'",
+                      (self._clock(), rid))
+
+    def _finish(self, rid: int, new_state: str, actual: float, allowed: tuple) -> bool:
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                row = c.execute("SELECT day, amount, state FROM reservations WHERE id=?", (rid,)).fetchone()
+                if row is None or row[2] not in allowed:
+                    c.execute("ROLLBACK")
+                    return False
+                day, amount, _ = row
+                c.execute("UPDATE spend SET total=MAX(0,total+?) WHERE day=?", (actual - amount, day))
+                c.execute("UPDATE reservations SET state=?, actual=?, updated=? WHERE id=?",
+                          (new_state, actual, self._clock(), rid))
+                c.execute("COMMIT")
+                return True
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+
+    def settle(self, rid: int, actual: float) -> bool:
+        """Record the real cost. Also corrects a reservation the reaper marked `unknown`. False if already final."""
+        return self._finish(rid, "settled", max(0.0, actual), self.OPEN_STATES + ("unknown",))
+
+    def release(self, rid: int) -> bool:
+        """Nothing was charged: refund in full. False if already final."""
+        return self._finish(rid, "released", 0.0, self.OPEN_STATES)
+
+    def reap(self, stale_after_s: float = 900.0) -> dict:
+        """Resolve reservations a crashed or abandoned caller never finished."""
+        cutoff = self._clock() - stale_after_s
+        with self._conn() as c:
+            rows = c.execute("SELECT id, state FROM reservations WHERE state IN ('reserved','sent') AND updated < ?",
+                             (cutoff,)).fetchall()
+        released = unknown = 0
+        for rid, state in rows:
+            if state == "reserved":
+                released += int(self.release(rid))
+            else:
+                with self._conn() as c:
+                    c.execute("UPDATE reservations SET state='unknown', updated=? WHERE id=? AND state='sent'",
+                              (self._clock(), rid))
+                unknown += 1
+        return {"released": released, "unknown": unknown}
+
+    def by_run(self, run_id: str) -> dict:
+        with self._conn() as c:
+            rows = c.execute("SELECT state, amount, actual FROM reservations WHERE run_id=?", (run_id,)).fetchall()
+        spent = sum((a if a is not None else amt) for st, amt, a in rows if st != "released")
+        return {"run_id": run_id, "calls": len(rows), "spent_usd": round(spent, 6),
+                "open": sum(1 for st, _, _ in rows if st in self.OPEN_STATES),
+                "unknown": sum(1 for st, _, _ in rows if st == "unknown")}
+
+    def report_today(self) -> dict:
+        day = self._day_of(self._clock())
+        with self._conn() as c:
+            rows = c.execute("SELECT agent, state, amount, actual FROM reservations WHERE day=?", (day,)).fetchall()
+        per_agent: dict = {}
+        for agent, st, amt, act in rows:
+            if st == "released":
+                continue
+            per_agent[agent or "?"] = round(per_agent.get(agent or "?", 0.0) + (act if act is not None else amt), 6)
+        return {"day": day, "total_usd": round(self.total_today(), 6), "cap_usd": self.cap, "per_agent_usd": per_agent,
+                "unknown_calls": sum(1 for _, st, _, _ in rows if st == "unknown"),
+                "open_calls": sum(1 for _, st, _, _ in rows if st in self.OPEN_STATES)}
 
     def total_today(self) -> float:
         with self._conn() as c:
@@ -255,7 +362,8 @@ class PolicyRouter:
         return None
 
     def generate(self, system_prompt: str, messages: List[Dict[str, str]], labels: Labels,
-                 policy: ModelPolicy, est_tokens: int) -> ModelReply:
+                 policy: ModelPolicy, est_tokens: int, *, run_id: Optional[str] = None,
+                 agent: Optional[str] = None) -> ModelReply:
         attempts: List[dict] = []
         reply = self._try_local(system_prompt, messages, attempts)
         if reply:
@@ -282,26 +390,32 @@ class PolicyRouter:
                 attempts.append({"provider": name, "tier": "cloud", "ok": False, "error": f"skipped: {lim_why}",
                                  "skipped": "rate_limit", "wait_s": round(wait, 1)})
                 continue
-            reserved = 0.0
+            reserved, rid = 0.0, None
             if self.spend is not None and not entry.free:
                 try:
-                    reserved = self.spend.reserve(entry.worst_case_cost(est_tokens))
+                    reserved = entry.worst_case_cost(est_tokens)
+                    rid = self.spend.open(reserved, run_id=run_id, agent=agent, provider=name)
                 except SpendCapExceeded as e:
+                    reserved = 0.0
                     cap_blocked = True
                     attempts.append({"provider": name, "tier": "cloud", "ok": False, "error": f"skipped: {e}",
                                      "skipped": "spend_cap"})
                     continue
             try:
+                if rid is not None:
+                    self.spend.mark_sent(rid)
                 r = entry.provider.generate(system_prompt, messages)
             except LLMBadOutput as e:
                 # The call happened (and may be billed): keep the reservation, hand the salvage text back so the
                 # runner counts an invalid turn and repairs, instead of treating a model fault as an outage.
                 attempts.append({"provider": name, "tier": "cloud", "ok": True, "error": f"bad_output: {e}"[:200]})
+                if rid is not None:
+                    self.spend.settle(rid, reserved)
                 return ModelReply(e.salvage, name, getattr(entry.provider, "model", "?"), "cloud", attempts,
                                   None, None, reserved)
             except LLMError as e:
-                if reserved and self.spend is not None:
-                    self.spend.adjust(-reserved)        # nothing was charged: refund the reservation
+                if rid is not None:
+                    self.spend.release(rid)             # nothing was charged: refund the reservation
                 attempts.append({"provider": name, "tier": "cloud", "ok": False, "error": str(e)})
                 continue
             i, o = self._usage(r)
@@ -309,10 +423,12 @@ class PolicyRouter:
             if not entry.free:
                 if i is not None and o is not None:
                     cost = entry.actual_cost(i, o)
-                    if self.spend is not None:
-                        self.spend.adjust(cost - reserved)      # settle to the real figure
+                    if rid is not None:
+                        self.spend.settle(rid, cost)            # settle to the real figure
                 else:
                     cost = reserved                             # no usage reported: keep the worst case
+                    if rid is not None:
+                        self.spend.settle(rid, reserved)
             if i is not None and o is not None:
                 entry.limiter.correct(est_tokens + entry.max_output_tokens, i + o)
             attempts.append({"provider": name, "tier": "cloud", "ok": True, "error": ""})

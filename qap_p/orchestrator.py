@@ -10,13 +10,14 @@ import hashlib
 import secrets
 import time
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 from .config import Config
 from .models import Device, DeviceRole, NodeState
 from .store import Store
 from .ledger import Ledger
 from .hardware_key import HardwareKeyProvider, SimulatedHardwareKey
+from .attestation import AttestationVerifier, FailClosedVerifier
 from .trust import TrustFactors, compute_trust_score, can_issue_authorization
 from .vault import Vault
 from .auth import AuthorizationService, AuthorizationError
@@ -27,8 +28,10 @@ from .chaos import ChaosEngineer
 
 
 class Orchestrator:
-    def __init__(self, config: Optional[Config] = None):
+    def __init__(self, config: Optional[Config] = None, attestation_verifier: Optional[AttestationVerifier] = None):
         self.config = config or Config()
+        # Audit E-02: `hardware_backed` is decided by this verifier ONLY. Default is fail-closed.
+        self.attestation_verifier = attestation_verifier or FailClosedVerifier()
         self.store = Store(self.config.db_path)
         self.ledger = Ledger(self.config.db_path)
         self.vault = Vault(self.config.vault_key_path, self.store, self.ledger)
@@ -79,19 +82,31 @@ class Orchestrator:
 
     # ---- device enrollment ----
     def enroll_device(self, device_id: str, role: DeviceRole,
-                       key_provider: Optional[HardwareKeyProvider] = None) -> Device:
+                       key_provider: Optional[HardwareKeyProvider] = None,
+                       attestation_evidence: Optional[Any] = None) -> Device:
         key_provider = key_provider or SimulatedHardwareKey()
+        pem = key_provider.public_key_pem()
+        verdict = self.attestation_verifier.verify(
+            device_id=device_id, public_key_pem=pem, attestation_type=key_provider.attestation_type,
+            evidence=attestation_evidence)
+        if self.config.require_verified_attestation and not verdict.verified:
+            self.ledger.append("device_enrollment_refused", {
+                "device_id": device_id, "role": role.value, "reason": verdict.detail,
+                "attestation_verifier": self.attestation_verifier.name})
+            raise ValueError(f"enrollment refused: attestation not verified ({verdict.detail})")
         device = Device(
             device_id=device_id,
             role=role,
-            public_key_pem=key_provider.public_key_pem(),
-            hardware_backed=True,
+            public_key_pem=pem,
+            hardware_backed=bool(verdict.verified),
             attestation_type=key_provider.attestation_type,
             enrolled_at=time.time(),
         )
         self.store.create_device(device)
         self.ledger.append("device_enrolled", {
             "device_id": device_id, "role": role.value, "attestation_type": device.attestation_type,
+            "hardware_backed": device.hardware_backed, "attestation_detail": verdict.detail,
+            "attestation_verifier": self.attestation_verifier.name,
         })
         return device
 

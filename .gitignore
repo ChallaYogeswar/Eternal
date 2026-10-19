@@ -16,6 +16,7 @@ mcp_servers/**/ha_state.json
 .env
 .env.*
 !.env.example
+/secrets/
 
 # Generated Phase 2 index
 /data/chroma/

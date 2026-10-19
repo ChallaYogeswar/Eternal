@@ -42,6 +42,15 @@ def orchestrator(tmp_data_dir):
 
 
 @pytest.fixture()
+def attested_orchestrator(tmp_data_dir):
+    """Orchestrator whose verifier declares devices hardware-backed. TEST ONLY (see qap_p/attestation.py)."""
+    from qap_p.attestation import StaticVerifierForTests
+    from qap_p.orchestrator import Orchestrator
+    from qap_p.config import Config as QapConfig
+    return Orchestrator(QapConfig(data_dir=tmp_data_dir), attestation_verifier=StaticVerifierForTests(True))
+
+
+@pytest.fixture()
 def trust_lookup(orchestrator):
     from device_control_gateway.trust_bridge import QapPTrustLookup
     return QapPTrustLookup(orchestrator)

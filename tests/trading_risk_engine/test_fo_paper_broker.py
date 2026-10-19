@@ -131,3 +131,16 @@ def test_state_persists_across_separate_broker_instances(tmp_path):
 def test_close_nonexistent_position_returns_none_not_a_crash(tmp_path):
     broker = _broker(tmp_path)
     assert broker.close_position("does-not-exist", exit_price=100.0) is None
+
+
+@pytest.mark.parametrize("bad", ["200", "abc", None, 0, -5.0, float("nan"), float("inf"), True])
+def test_close_position_rejects_non_numeric_or_non_positive_exit_price(tmp_path, bad):
+    """Audit E-10: a bad exit price must fail loudly BEFORE touching cash or positions."""
+    broker = _broker(tmp_path)
+    broker.open_option_position(_call(), "LONG", num_lots=1, premium=150.0, margin_required=9750.0,
+                                stop_loss_price=75.0, take_profit_price=300.0, entry_date="2026-08-10")
+    pid = broker.get_positions()[0]["position_id"]
+    cash_before = broker.get_margins()["cash"]
+    with pytest.raises(ValueError, match="exit_price"):
+        broker.close_position(pid, exit_price=bad)
+    assert len(broker.get_positions()) == 1 and broker.get_margins()["cash"] == cash_before

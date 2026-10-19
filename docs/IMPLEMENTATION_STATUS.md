@@ -27,7 +27,12 @@ them rather than re-explaining.
 
 ## Test suite status
 
-All 501 tests pass. `docs/` now contains all six seeded documents —
+**Canonical test status (audit E-09):** the authoritative result is the CI run for the commit
+(`.github/workflows/ci.yml`, with `constraints.txt` pinning the dependencies). Last full run in the build sandbox, after the
+audit fixes: **1025 passed, 10 skipped, 0 failed** (the skips are scenarios that do not apply to a given daemon). Counts
+quoted elsewhere in this file (501, 618) are historical snapshots of earlier drops, not the current state.
+
+`docs/` now contains all six seeded documents —
 `Eternal_Master_Build_Plan.md`, `QAP_Whitepaper_CHALLAYOGESWAR.md`,
 `RCAP_Whitepaper_CHALLAYOGESWAR.md`, `README.md`, `PROJECT_TREE.md`,
 and this file — all indexed via `scripts/eternal_core/ingest_docs.py`.
@@ -304,7 +309,7 @@ Wiring: `mcp_servers/trading_engine/data.py` (`FOTradingEngine`), `server.py` (t
 `core_gateway.py` is tool-agnostic and needed no change. Full details and validation results:
 `docs/PHASE6_FO_README.md`.
 
-Validated by actually running: 618-test suite (14 voice tests fail only because eSpeak is not installed
+Validated by actually running (historical snapshot at the F&O drop): 618-test suite (14 voice tests fail only because eSpeak is not installed
 in the build sandbox), demo 38/38, live MCP e2e 13/13, live HTTP e2e 22/22. Four real defects found
 and fixed during that run (see the F&O README).
 
@@ -395,5 +400,15 @@ or closes a real product gap, rather than a sandbox artifact:
 Planned in `docs/ORCHESTRATOR_LAYERS_PLAN.md`; O0a (runtime foundation) built and tested — see
 `docs/ORCHESTRATION_README.md`. P1 (Gemini/Groq providers, per-provider data ceilings, rate limits, spend settlement)
 and P2 (validation harness, `docs/VALIDATION_HARNESS.md`) are built; the first live free-tier runs were INCONCLUSIVE
-(provider/model output faults, now handled as bad turns) and no provider is approved yet. No specialist agents,
-capability verifier (O0b), or new MCP servers exist yet.
+(provider/model output faults, now handled as bad turns) and no provider is approved yet. No specialist agents
+or new MCP servers exist yet. O0b (capability tokens, identity envelope, per-run consent, signed external
+checkpoints, crash-safe spend reservations, and the `agent_chain/` composition root over the real Phase 4/5/6 + RCAP
+chain) is built and tested; see `docs/ORCHESTRATION_README.md`.
+
+
+---
+
+## Audit fixes (forensic audit of 19 Oct 2026)
+
+See `docs/AUDIT_FIXES.md` for what each finding changed, what is fixed in code, and what cannot be fixed without real
+hardware, credentials or live systems (E-03, E-04, E-05 and the real adapters in E-06/E-07).

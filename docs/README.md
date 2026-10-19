@@ -23,8 +23,8 @@ is no separate "semantic" name layered on top.
 ## Setup
 
 ```powershell
-cd "C:\Users\chall\Downloads\Eternal AI Assistant\Eternal"
-python -m pip install -r requirements.txt
+cd <path-to-your-Eternal-folder>
+python -m pip install -r requirements.txt -c constraints.txt
 $env:PYTHONPATH = (Get-Location).Path
 ```
 

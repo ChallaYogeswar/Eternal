@@ -32,12 +32,50 @@ caller kind, evidence resolution, web/internal guard, PII-to-cloud, token budget
   pacing, Markdown + JSON report, CLI. See `docs/VALIDATION_HARNESS.md`.
 - Not verified here: live Gemini/Groq calls (sandbox has no route). Run `--smoke` then `--run` on your machine.
 
-## Deliberately NOT in O0a (and why)
-- **Capability tokens / verifier, per-run consent grants, signed external checkpoint → O0b.** Until O0b the broker's
-  allowlist is the only per-agent enforcement and WRITE tools always pause (`awaiting_confirmation`). Tripwire tests
-  are not proof; the verifier is the real control.
-- **Not wired to the real gateway yet.** Tests use a fake gateway with the same call signature as `Phase6CoreGateway`.
-  No agents exist yet (O1+), so there is no wire-level (MCP/HTTP) layer to validate for O0a.
+## O0b — security base (built and verified)
+
+Pure logic lives in `orchestration/`; everything that touches the real chain, a socket or a subprocess lives in the new
+top-level `agent_chain/` package (the tripwire tests forbid `orchestration/` from importing phase packages, sockets or
+subprocesses, and nothing in `orchestration/` or `eternal_core` may import `agent_chain`).
+
+| Piece | Where | What it does |
+|---|---|---|
+| Capability tokens | `orchestration/capability.py` | Ed25519-signed, per run: agent, run, session, tools, max tier, call cap, expiry, origin channel. The verifier holds only the public key. A restarted verifier voids older tokens; `revoke_run` (also children) and `revoke_all` (kill switch). 13 denial reasons. |
+| Identity envelope | `orchestration/identity.py` | `_identity` argument signed over identity, run, tool, args digest and a 30 s expiry, for MCP servers that must know the caller. |
+| Per-run consent | `orchestration/consent.py` | WRITE calls pause until a human approves through typed text or an app tap; an agent or a spoken request cannot approve. One run, one tool, N uses, expiry. |
+| Signed checkpoints | `orchestration/checkpoint.py` | Ledger head + count signed by a signer process that is not the runtime. Detects the "edit a row and recompute the chain" attack, truncation, forged signatures, gaps, staleness and off-box disagreement. |
+| Crash-safe spend | `orchestration/model_policy.py` `SpendLedger` | Reservation ids with `open -> mark_sent -> settle/release`, per run and agent. A reaper releases never-sent reservations and keeps possibly-spent ones as `unknown`; late settles from abandoned threads are idempotent. Legacy `reserve/adjust` kept. |
+| Chain wrapper | `agent_chain/gateway.py` | `CapabilityGateway` verifies the token, strips `_` arguments, adds the identity envelope for configured tools, then passes a PLAIN `WriteCallRequest` into the unchanged Phase 6/5/4 + RCAP chain. `kill()` revokes agent authority first, then runs the existing kill switch. |
+| Per-run authority | `agent_chain/port.py` | Issues one token per run, takes the per-tool ROTATE grants from Phase 5's guarded `grant_tool_permission` (a quarantined session cannot start agent work), revokes everything on `close()`. Tier comes from the RCAP registry, never from the agent. |
+| Signer socket | `agent_chain/signer_socket.py`, `scripts/orchestration/checkpoint_signerd.py` | One JSON line in, one out. Accepts only (head, count, prev); not a signing oracle. |
+| Off-box copies | `agent_chain/sinks.py` | `CommandSink` runs an argv list (no shell) for scp over Tailscale or a git push. A failing sink is logged as `checkpoint_failed`, not silent. |
+
+Tests: `tests/orchestration/test_capability.py`, `test_checkpoint.py`, `test_spend_reservations.py`, and
+`tests/agent_chain/` (real QAP-P + RCAP + Phase 4/5/6 chain with only the MCP executor faked; mutation-checked: with
+verification disabled, 10 of those tests fail).
+
+### Running the signer as a separate OS user
+```
+sudo useradd --system --create-home eternal-signer
+sudo -u eternal-signer python scripts/orchestration/checkpoint_signerd.py init --key ~/ckpt.key --pub ~/ckpt.pub
+sudo -u eternal-signer python scripts/orchestration/checkpoint_signerd.py serve --key ~/ckpt.key \
+     --state ~/state.json --socket /run/eternal-signer/signer.sock
+```
+Give the socket's group to the runtime user (mode 660). Copy only `ckpt.pub` where the Auditor can read it. The daemon
+refuses to start if the key file is readable by group or other. Later the same `SignerPort` can be backed by a phone
+WebAuthn approval instead.
+
+### Honest limits of O0b
+- Ed25519 tokens, not HMAC as the plan's wording said: the verifier can then hold a public key only.
+- The OS-user separation is a deployment step; the tests prove the protocol and the refusal rules, not your OS setup.
+- The capability layer adds "may this agent call this tool at all"; consent, voice gate, ROTATE and RCAP still decide
+  independently (a WRITE tool is still refused without Phase 4 consent even with a valid token).
+- Spend: a call whose request was sent and never answered stays counted as `unknown` (conservative), not refunded.
+
+## Deliberately NOT in O0a (status after O0b noted above) (and why)
+- ~~Capability tokens / verifier, per-run consent grants, signed external checkpoint~~ → built in O0b (above).
+- **Wired to the real gateway in O0b** through `agent_chain/` (integration tests there). Still no agents (O1+) and no
+  live MCP subprocess run with agent traffic.
 - **Tool timeout cannot kill the MCP subprocess** (sync gateway; amendment A6) — the call is abandoned and reported.
 - Token counts are estimates (len/4); providers do not report usage.
 - Real-model behaviour (JSON reliability, injection resistance) is untested: the build sandbox cannot reach Ollama.
